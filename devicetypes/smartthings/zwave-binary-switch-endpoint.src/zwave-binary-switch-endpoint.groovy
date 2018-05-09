@@ -12,7 +12,7 @@
  *
  */
 metadata {
-	definition(name: "Binary Switch Endpoint", namespace: "smartthings", author: "SmartThings") {
+	definition(name: "Z-Wave Binary Switch Endpoint", namespace: "smartthings", author: "SmartThings", mnmn: "SmartThings", vid: "generic-switch") {
 		capability "Actuator"
 		capability "Health Check"
 		capability "Refresh"
@@ -98,4 +98,3 @@ def ping() {
 def refresh() {
 	parent.sendCommand(device, zwave.switchBinaryV1.switchBinaryGet())
 }
-
