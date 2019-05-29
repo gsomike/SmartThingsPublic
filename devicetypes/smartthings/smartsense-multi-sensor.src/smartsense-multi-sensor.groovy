@@ -117,6 +117,18 @@ metadata {
 	}
 }
 
+private List<Map> collectAttributes(Map descMap) {
+	List<Map> descMaps = new ArrayList<Map>()
+
+	descMaps.add(descMap)
+
+	if (descMap.additionalAttrs) {
+		descMaps.addAll(descMap.additionalAttrs)
+	}
+
+	return  descMaps
+}
+
 def parse(String description) {
 	def maps = []
 	maps << zigbee.getEvent(description)
@@ -126,8 +138,23 @@ def parse(String description) {
 			maps += parseIasMessage(description)
 		} else {
 			Map descMap = zigbee.parseDescriptionAsMap(description)
-			if (descMap?.clusterInt == 0x0001 && descMap.commandInt != 0x07 && descMap?.value) {
-				maps << getBatteryResult(Integer.parseInt(descMap.value, 16))
+
+			if (descMap?.clusterInt == zigbee.POWER_CONFIGURATION_CLUSTER && descMap.commandInt != 0x07 && descMap.value) {
+				List<Map> descMaps = collectAttributes(descMap)
+
+				if (device.getDataValue("manufacturer") == "Samjin") {
+					def battMap = descMaps.find { it.attrInt == 0x0021 }
+
+					if (battMap) {
+						maps += getBatteryPercentageResult(Integer.parseInt(battMap.value, 16))
+					}
+				} else {
+					def battMap = descMaps.find { it.attrInt == 0x0020 }
+
+					if (battMap) {
+						maps += getBatteryResult(Integer.parseInt(battMap.value, 16))
+					}
+				}
 			} else if (descMap?.clusterInt == 0x0500 && descMap.attrInt == 0x0002) {
 				def zs = new ZoneStatus(zigbee.convertToInt(descMap.value, 16))
 				maps += translateZoneStatus(zs)
@@ -263,6 +290,7 @@ private Map getBatteryResult(rawValue) {
 		result.name = 'battery'
 		result.translatable = true
 		result.descriptionText = "{{ device.displayName }} battery was {{ value }}%"
+
 		if (device.getDataValue("manufacturer") == "SmartThings") {
 			volts = rawValue // For the batteryMap to work the key needs to be an int
 			def batteryMap = [28: 100, 27: 100, 26: 100, 25: 90, 24: 90, 23: 70,
@@ -309,6 +337,20 @@ private Map getBatteryResult(rawValue) {
 	return result
 }
 
+private Map getBatteryPercentageResult(rawValue) {
+	log.debug "Battery Percentage rawValue = ${rawValue} -> ${rawValue / 2}%"
+	def result = [:]
+
+	if (0 <= rawValue && rawValue <= 200) {
+		result.name = 'battery'
+		result.translatable = true
+		result.descriptionText = "{{ device.displayName }} battery was {{ value }}%"
+		result.value = Math.round(rawValue / 2)
+	}
+
+	return result
+}
+
 List<Map> garageEvent(zValue) {
 	List<Map> results = []
 	def absValue = zValue.abs()
@@ -338,11 +380,17 @@ def ping() {
 
 def refresh() {
 	log.debug "Refreshing Values "
+	def refreshCmds = []
 
-	def refreshCmds = zigbee.readAttribute(zigbee.TEMPERATURE_MEASUREMENT_CLUSTER, 0x0000) +
-			zigbee.readAttribute(zigbee.POWER_CONFIGURATION_CLUSTER, 0x0020) +
-			zigbee.readAttribute(0xFC02, 0x0010, [mfgCode: manufacturerCode]) +
-			zigbee.readAttribute(zigbee.IAS_ZONE_CLUSTER, zigbee.ATTRIBUTE_IAS_ZONE_STATUS) + zigbee.enrollResponse()
+	if (device.getDataValue("manufacturer") == "Samjin") {
+		refreshCmds += zigbee.readAttribute(zigbee.POWER_CONFIGURATION_CLUSTER, 0x0021)
+	} else {
+		refreshCmds += zigbee.readAttribute(zigbee.POWER_CONFIGURATION_CLUSTER, 0x0020)
+	}
+	refreshCmds += zigbee.readAttribute(zigbee.TEMPERATURE_MEASUREMENT_CLUSTER, 0x0000) +
+		zigbee.readAttribute(0xFC02, 0x0010, [mfgCode: manufacturerCode]) +
+		zigbee.readAttribute(zigbee.IAS_ZONE_CLUSTER, zigbee.ATTRIBUTE_IAS_ZONE_STATUS) +
+		zigbee.enrollResponse()
 
 	return refreshCmds
 }
@@ -353,7 +401,10 @@ def configure() {
 	sendEvent(name: "checkInterval", value: 2 * 60 * 60 + 1 * 60, displayed: false, data: [protocol: "zigbee", hubHardwareId: device.hub.hardwareID, offlinePingable: "1"])
 
 	log.debug "Configuring Reporting"
-	def configCmds = []
+	def configCmds = [zigbee.readAttribute(zigbee.TEMPERATURE_MEASUREMENT_CLUSTER, 0x0000), zigbee.readAttribute(0xFC02, 0x0010, [mfgCode: manufacturerCode])]
+	def batteryAttr = device.getDataValue("manufacturer") == "Samjin" ? 0x0021 : 0x0020
+	configCmds += zigbee.readAttribute(zigbee.POWER_CONFIGURATION_CLUSTER, batteryAttr)
+	configCmds += zigbee.enrollResponse()
 
 	if (device.getDataValue("manufacturer") == "SmartThings") {
 		log.debug "Refreshing Values for manufacturer: SmartThings "
@@ -377,7 +428,7 @@ def configure() {
 	// temperature minReportTime 30 seconds, maxReportTime 5 min. Reporting interval if no activity
 	// battery minReport 30 seconds, maxReportTime 6 hrs by default
 	if (device.getDataValue("manufacturer") == "Samjin") {
-		configCmds += zigbee.batteryConfig() +
+		configCmds += zigbee.configureReporting(zigbee.POWER_CONFIGURATION_CLUSTER, 0x0021, DataType.UINT8, 30, 21600, 0x10) +
 				zigbee.temperatureConfig(30, 300) +
 				zigbee.configureReporting(0xFC02, 0x0010, DataType.BITMAP8, 0, 3600, 0x01, [mfgCode: manufacturerCode]) +
 				zigbee.configureReporting(0xFC02, 0x0012, DataType.INT16, 0, 3600, 0x0001, [mfgCode: manufacturerCode]) +
@@ -391,8 +442,10 @@ def configure() {
 				zigbee.configureReporting(0xFC02, 0x0013, DataType.INT16, 1, 3600, 0x0001, [mfgCode: manufacturerCode]) +
 				zigbee.configureReporting(0xFC02, 0x0014, DataType.INT16, 1, 3600, 0x0001, [mfgCode: manufacturerCode])
 	}
+	configCmds += zigbee.readAttribute(zigbee.POWER_CONFIGURATION_CLUSTER, batteryAttr)
+	configCmds += zigbee.readAttribute(zigbee.IAS_ZONE_CLUSTER, zigbee.ATTRIBUTE_IAS_ZONE_STATUS)
 
-	return refresh() + configCmds
+	return configCmds
 }
 
 def updated() {
